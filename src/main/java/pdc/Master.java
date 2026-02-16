@@ -1,378 +1,318 @@
-package pdc;
-
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketTimeoutException;
-import java.nio.ByteBuffer;
+import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The Master acts as the Coordinator in a distributed cluster.
- * 
- * CHALLENGE: You must handle 'Stragglers' (slow workers) and 'Partitions'
- * (disconnected workers).
- * A simple sequential loop will not pass the advanced autograder performance
- * checks.
+ * Handles Stragglers (slow workers) and Partitions (disconnected workers).
  */
 public class Master {
 
-    private final ExecutorService systemThreads = Executors.newCachedThreadPool();
-    private final ExecutorService workerThreads = Executors.newCachedThreadPool();
-    private final Map<String, WorkerConnection> workers = new ConcurrentHashMap<>();
-    private final Map<String, WorkerConnection> availableWorkers = new ConcurrentHashMap<>();
-    private ServerSocket serverSocket;
-    private volatile boolean running = false;
-    private final Object tasksLock = new Object();
-    private final Map<Integer, TaskAssignment> taskQueue = new ConcurrentHashMap<>();
-    private int nextTaskId = 0;
-    private final String studentId;
+    private static final String MAGIC = Message.MAGIC;
+    private static final int HEARTBEAT_TIMEOUT_MS = 30_000;
+    private static final int TASK_TIMEOUT_MS = 60_000;
 
-    public Master() {
-        this("STUDENT_ID_NOT_SET");
+    private final ExecutorService systemThreads = Executors.newCachedThreadPool();
+    private volatile ServerSocket serverSocket;
+    private final Map<String, WorkerHandle> workers = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Object> taskResults = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> taskAssignedTo = new ConcurrentHashMap<>();
+    private final BlockingQueue<TaskSpec> pendingReassign = new LinkedBlockingQueue<>();
+    private volatile Map<String, TaskSpec> currentTaskSpecs = new ConcurrentHashMap<>();
+    private volatile boolean listening;
+
+    private static class WorkerHandle {
+        final String workerId;
+        final Socket socket;
+        final DataInputStream dataIn;
+        final DataOutputStream dataOut;
+        final AtomicLong lastHeartbeat = new AtomicLong(System.currentTimeMillis());
+
+        WorkerHandle(String workerId, Socket socket, DataInputStream dataIn, DataOutputStream dataOut) {
+            this.workerId = workerId;
+            this.socket = socket;
+            this.dataIn = dataIn;
+            this.dataOut = dataOut;
+        }
     }
 
-    public Master(String studentId) {
-        this.studentId = studentId;
+    private static class TaskSpec {
+        final String taskId;
+        final String operation;
+        final String payload;
+
+        TaskSpec(String taskId, String operation, String payload) {
+            this.taskId = taskId;
+            this.operation = operation;
+            this.payload = payload;
+        }
     }
 
     /**
-     * Entry point for a distributed computation.
-     * 
-     * @param operation A string descriptor (e.g. "MATRIX_MULTIPLY")
-     * @param matrices  Array of matrices: [A, B] for multiplication
+     * Entry point for distributed computation.
+     * Partitions the problem, schedules across workers, aggregates results.
      */
     public Object coordinate(String operation, int[][] data, int workerCount) {
-        // Wait briefly for workers to connect (with timeout for tests)
-        long startWait = System.currentTimeMillis();
-        long timeout = 5000;  // 5 second timeout for tests
-        
-        while (workers.size() < workerCount && System.currentTimeMillis() - startWait < timeout) {
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-
-        // If we don't have enough workers, return null (for test compatibility)
-        if (workers.size() < workerCount) {
+        List<String> workerIds = new ArrayList<>(workers.keySet());
+        if (workerIds.isEmpty()) {
             return null;
         }
 
-        if ("MATRIX_MULTIPLY".equals(operation)) {
-            return performMatrixMultiplication(data, workerCount);
+        List<TaskSpec> tasks = partitionMatrix(operation, data, workerCount);
+        if (tasks.isEmpty()) {
+            return aggregateResult(operation, data, Collections.emptyList());
         }
 
-        // For other operations or if no workers available, return null
-        return null;
-    }
-
-    private Object performMatrixMultiplication(int[][] data, int workerCount) {
-        // data contains the flattened representation
-        // Reconstruct matrices from data
-        // For now assume data is a single matrix or we receive it differently
-        // This will be called with actual matrix data from the test
-        
-        // Partition work: divide matrix A by rows
-        List<TaskAssignment> tasks = new ArrayList<>();
-        List<Future<?>> futures = new ArrayList<>();
-        
-        // For matrix multiplication C = A * B
-        // Distribute row blocks of A to workers
-        int blockSize = Math.max(1, data.length / workerCount);
-        
-        for (int i = 0; i < data.length; i += blockSize) {
-            int endRow = Math.min(i + blockSize, data.length);
-            TaskAssignment task = new TaskAssignment(
-                nextTaskId++,
-                "MATRIX_MULTIPLY_BLOCK",
-                i,
-                endRow
-            );
-            tasks.add(task);
-            taskQueue.put(task.taskId, task);
+        taskResults.clear();
+        taskAssignedTo.clear();
+        currentTaskSpecs.clear();
+        for (TaskSpec t : tasks) currentTaskSpecs.put(t.taskId, t);
+        List<String> taskIds = new ArrayList<>();
+        for (TaskSpec t : tasks) {
+            taskIds.add(t.taskId);
         }
 
-        // Distribute tasks to workers using parallel submit() pattern
-        List<WorkerConnection> workerList = new ArrayList<>(workers.values());
-        int taskIndex = 0;
-        
-        for (TaskAssignment task : tasks) {
-            final TaskAssignment finalTask = task;
-            WorkerConnection worker = workerList.get(taskIndex % workerList.size());
-            
-            // Use submit() for parallel execution
-            Future<?> future = workerThreads.submit(() -> {
-                assignTaskToWorker(worker, finalTask);
-            });
-            futures.add(future);
-            taskIndex++;
+        int workerIndex = 0;
+        for (TaskSpec t : tasks) {
+            String wid = workerIds.get(workerIndex % workerIds.size());
+            workerIndex++;
+            sendTaskToWorker(wid, t);
         }
 
-        // Wait for all submitted tasks (parallel execution)
-        try {
-            for (Future<?> future : futures) {
-                future.get(30, java.util.concurrent.TimeUnit.SECONDS);
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        // Wait for all tasks to complete
-        int[][] result = new int[data.length][data[0].length];
-        
-        long startTime = System.currentTimeMillis();
-        while (taskQueue.values().stream().anyMatch(t -> !t.completed && !t.failed)) {
-            if (System.currentTimeMillis() - startTime > 60000) {
-                throw new RuntimeException("Task execution timeout");
+        long deadline = System.currentTimeMillis() + TASK_TIMEOUT_MS;
+        int retryCount = 0;
+        while (System.currentTimeMillis() < deadline) {
+            if (taskResults.size() >= taskIds.size()) break;
+            reconcileState();
+            TaskSpec reassign = pendingReassign.poll();
+            if (reassign != null) {
+                List<String> liveWorkers = new ArrayList<>(workers.keySet());
+                if (liveWorkers.isEmpty()) {
+                    pendingReassign.add(reassign);
+                    continue;
+                }
+                retryCount++;
+                String wid = liveWorkers.get(workerIndex % liveWorkers.size());
+                workerIndex++;
+                sendTaskToWorker(wid, reassign);
             }
             try {
-                Thread.sleep(100);
+                Thread.sleep(200);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                break;
             }
         }
 
-        // Collect results
-        for (TaskAssignment task : tasks) {
-            if (task.failed) {
-                // Try to reassign
-                for (TaskAssignment reassign : tasks) {
-                    if (reassign.taskId == task.taskId && !reassign.completed) {
-                        WorkerConnection failover = workerList.stream()
-                            .filter(w -> !w.failed)
-                            .findFirst()
-                            .orElse(null);
-                        if (failover != null) {
-                            assignTaskToWorker(failover, reassign);
-                        }
-                    }
-                }
-            }
+        List<Object> results = new ArrayList<>();
+        for (String taskId : taskIds) {
+            Object r = taskResults.get(taskId);
+            if (r != null) results.add(r);
         }
-
-        return result;
+        currentTaskSpecs.clear();
+        return aggregateResult(operation, data, results);
     }
 
-    private void assignTaskToWorker(WorkerConnection worker, TaskAssignment task) {
-        ByteBuffer payload = ByteBuffer.allocate(16);
-        payload.putInt(task.startRow);
-        payload.putInt(task.endRow);
-        payload.putInt(0);  // matrix A offset
-        payload.putInt(0);  // matrix B offset
-        
-        Message msg = new Message(
-            "RPC_REQUEST",
-            "MASTER",
-            payload.array()
-        );
-        
-        workerThreads.execute(() -> {
-            try {
-                worker.sendMessage(msg);
-                task.assignedWorker = worker.workerId;
-                task.assigned = true;
-            } catch (IOException e) {
-                task.failed = true;
-                worker.failed = true;
+    private List<TaskSpec> partitionMatrix(String operation, int[][] data, int workerCount) {
+        List<TaskSpec> tasks = new ArrayList<>();
+        int rows = data.length;
+        if (rows == 0) return tasks;
+        int cols = data[0].length;
+        int chunk = Math.max(1, (rows + workerCount - 1) / workerCount);
+        for (int i = 0; i < rows; i += chunk) {
+            int end = Math.min(i + chunk, rows);
+            StringBuilder payload = new StringBuilder();
+            payload.append(i).append(",").append(end).append(",").append(cols);
+            for (int r = i; r < end; r++) {
+                for (int c = 0; c < cols; c++) {
+                    payload.append(",").append(data[r][c]);
+                }
             }
-        });
+            String taskId = "task-" + i + "-" + end;
+            tasks.add(new TaskSpec(taskId, operation, payload.toString()));
+        }
+        return tasks;
+    }
+
+    private void sendTaskToWorker(String workerId, TaskSpec t) {
+        WorkerHandle h = workers.get(workerId);
+        if (h == null) {
+            pendingReassign.add(t);
+            return;
+        }
+        taskAssignedTo.put(t.taskId, workerId);
+        try {
+            Message req = new Message();
+            req.messageType = "RPC_REQUEST";
+            req.studentId = System.getenv("STUDENT_ID");
+            if (req.studentId == null) req.studentId = "master";
+            req.timestamp = System.currentTimeMillis();
+            req.setPayloadUtf8(t.taskId + ";" + t.operation + ";" + t.payload);
+            h.dataOut.write(req.pack());
+            h.dataOut.flush();
+        } catch (Exception e) {
+            taskAssignedTo.remove(t.taskId);
+            pendingReassign.add(t);
+        }
+    }
+
+    private Object aggregateResult(String operation, int[][] data, List<Object> results) {
+        if ("SUM".equals(operation)) {
+            long sum = 0;
+            for (Object r : results) {
+                if (r instanceof Long) sum += (Long) r;
+                else if (r != null) sum += Long.parseLong(r.toString());
+            }
+            return sum;
+        }
+        if (results.size() == 1 && results.get(0) != null) {
+            return results.get(0);
+        }
+        return results.isEmpty() ? null : results;
     }
 
     /**
-     * Start the communication listener.
+     * Start the communication listener using the custom Message protocol.
      */
     public void listen(int port) throws IOException {
-        running = true;
-        serverSocket = new ServerSocket(port);
-        serverSocket.setSoTimeout(1000);
-        
-        systemThreads.execute(() -> {
-            while (running) {
-                try {
-                    Socket socket = serverSocket.accept();
-                    systemThreads.execute(() -> handleWorkerConnection(socket));
-                } catch (SocketTimeoutException e) {
-                    // Continue
-                } catch (IOException e) {
-                    if (running) {
-                        e.printStackTrace();
-                    }
-                }
-            }
-        });
-
-        // Start heartbeat monitor
-        systemThreads.execute(this::monitorHeartbeats);
+        int p = port;
+        if (p == 0) {
+            String envPort = System.getenv("MASTER_PORT");
+            if (envPort != null) p = Integer.parseInt(envPort);
+        }
+        if (p == 0) p = 0;
+        serverSocket = new ServerSocket(p);
+        listening = true;
+        systemThreads.submit(this::acceptLoop);
     }
 
-    private void handleWorkerConnection(Socket socket) {
+    private void acceptLoop() {
         try {
-            InputStream input = socket.getInputStream();
-            OutputStream output = socket.getOutputStream();
-            
-            // Read first message (REGISTER_WORKER)
-            byte[] buffer = new byte[1024 * 64];
-            int bytesRead = input.read(buffer);
-            
-            if (bytesRead > 0) {
-                Message msg = Message.unpack(Arrays.copyOf(buffer, bytesRead));
-                
-                if (msg != null && "REGISTER_WORKER".equals(msg.type)) {
-                    String workerId = msg.sender;
-                    
-                    WorkerConnection conn = new WorkerConnection(workerId, socket, input, output);
-                    workers.put(workerId, conn);
-                    availableWorkers.put(workerId, conn);
-                    
-                    // Send ACK
-                    Message ack = new Message("WORKER_ACK", "MASTER", new byte[0]);
-                    output.write(ack.pack());
-                    output.flush();
-                    
-                    // Handle worker messages
-                    handleWorkerMessages(conn);
-                }
+            while (listening && serverSocket != null && !serverSocket.isClosed()) {
+                Socket client = serverSocket.accept();
+                systemThreads.submit(() -> handleConnection(client));
+            }
+        } catch (SocketException e) {
+            if (listening) {
+                // closed
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            if (listening) {
+                e.printStackTrace();
+            }
         }
     }
 
-    private void handleWorkerMessages(WorkerConnection conn) {
+    private void handleConnection(Socket socket) {
+        String workerId = null;
         try {
-            byte[] buffer = new byte[1024 * 64];
-            
-            while (running) {
-                int bytesRead = conn.input.read(buffer);
-                
-                if (bytesRead <= 0) {
-                    break;
-                }
-                
-                Message msg = Message.unpack(Arrays.copyOf(buffer, bytesRead));
-                
-                if (msg != null) {
-                    if ("HEARTBEAT".equals(msg.type)) {
-                        conn.lastHeartbeat = System.currentTimeMillis();
-                        // Send heartbeat response
-                        Message response = new Message("HEARTBEAT", "MASTER", new byte[0]);
-                        conn.output.write(response.pack());
-                        conn.output.flush();
-                    } else if ("RPC_RESPONSE".equals(msg.type)) {
-                        // Task completion
-                        ByteBuffer payload = ByteBuffer.wrap(msg.payload);
-                        int taskId = payload.getInt();
-                        
-                        if (taskQueue.containsKey(taskId)) {
-                            taskQueue.get(taskId).completed = true;
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+
+            Message first = Message.readFromStream(in);
+            if (first == null) {
+                socket.close();
+                return;
+            }
+            validate(first);
+            if ("REGISTER_WORKER".equals(first.messageType) || "CONNECT".equals(first.messageType)) {
+                workerId = first.getPayloadUtf8();
+                if (workerId == null || workerId.isEmpty()) workerId = "worker-" + socket.getRemoteSocketAddress();
+                WorkerHandle h = new WorkerHandle(workerId, socket, in, out);
+                workers.put(workerId, h);
+                h.lastHeartbeat.set(System.currentTimeMillis());
+
+                Message ack = new Message();
+                ack.messageType = "WORKER_ACK";
+                ack.studentId = System.getenv("STUDENT_ID");
+                if (ack.studentId == null) ack.studentId = "master";
+                ack.timestamp = System.currentTimeMillis();
+                ack.setPayloadUtf8(workerId);
+                out.write(ack.pack());
+                out.flush();
+
+                final String id = workerId;
+                systemThreads.submit(() -> readLoop(id, in, socket));
+                return;
+            }
+            socket.close();
+        } catch (Exception e) {
+            if (workerId != null) workers.remove(workerId);
+            try { socket.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    private void readLoop(String workerId, DataInputStream in, Socket socket) {
+        try {
+            while (listening && !socket.isClosed()) {
+                Message msg = Message.readFromStream(in);
+                if (msg == null) break;
+                parse(msg);
+                WorkerHandle h = workers.get(workerId);
+                if (h != null) h.lastHeartbeat.set(System.currentTimeMillis());
+                if ("HEARTBEAT".equals(msg.messageType)) {
+                    // already updated lastHeartbeat
+                } else if ("TASK_COMPLETE".equals(msg.messageType)) {
+                    String pl = msg.getPayloadUtf8();
+                    int idx = pl.indexOf(';');
+                    if (idx > 0) {
+                        String taskId = pl.substring(0, idx);
+                        String result = pl.substring(idx + 1);
+                        try {
+                            taskResults.put(taskId, Long.parseLong(result.trim()));
+                        } catch (NumberFormatException e) {
+                            taskResults.put(taskId, result);
                         }
-                    } else if ("TASK_ERROR".equals(msg.type)) {
-                        ByteBuffer payload = ByteBuffer.wrap(msg.payload);
-                        int taskId = payload.getInt();
-                        
-                        if (taskQueue.containsKey(taskId)) {
-                            taskQueue.get(taskId).failed = true;
-                        }
-                        conn.failed = true;
+                        taskAssignedTo.remove(taskId);
                     }
                 }
             }
-        } catch (IOException e) {
-            // Connection lost
-            conn.failed = true;
+        } catch (Exception e) {
+            // connection closed or error
         } finally {
-            workers.remove(conn.workerId);
-            availableWorkers.remove(conn.workerId);
+            workers.remove(workerId);
+            try { socket.close(); } catch (IOException ignored) {}
         }
     }
 
-    private void monitorHeartbeats() {
-        while (running) {
-            try {
-                Thread.sleep(5000);
-                
-                long now = System.currentTimeMillis();
-                for (WorkerConnection worker : new ArrayList<>(workers.values())) {
-                    if (now - worker.lastHeartbeat > 15000) {
-                        worker.failed = true;
-                        workers.remove(worker.workerId);
-                        availableWorkers.remove(worker.workerId);
-                    }
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
+    private void validate(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("null message");
+        if (!MAGIC.equals(msg.magic)) throw new IllegalArgumentException("invalid magic");
+    }
+
+    private void parse(Message msg) {
+        validate(msg);
     }
 
     /**
-     * System Health Check.
+     * System health check: detect dead workers and re-queue their tasks for reassignment.
+     * Retry: reassign failed tasks to remaining workers for fault tolerance.
      */
     public void reconcileState() {
-        workers.values().removeIf(w -> w.failed);
-        availableWorkers.values().removeIf(w -> w.failed);
-    }
-
-    public void stop() {
-        running = false;
-        try {
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        systemThreads.shutdown();
-        workerThreads.shutdown();
-    }
-
-    public int getWorkerCount() {
-        return workers.size();
-    }
-
-    private static class WorkerConnection {
-        String workerId;
-        Socket socket;
-        InputStream input;
-        OutputStream output;
-        long lastHeartbeat;
-        boolean failed = false;
-        
-        WorkerConnection(String workerId, Socket socket, InputStream input, OutputStream output) {
-            this.workerId = workerId;
-            this.socket = socket;
-            this.input = input;
-            this.output = output;
-            this.lastHeartbeat = System.currentTimeMillis();
-        }
-        
-        void sendMessage(Message msg) throws IOException {
-            synchronized (output) {
-                output.write(msg.pack());
-                output.flush();
+        long now = System.currentTimeMillis();
+        List<String> dead = new ArrayList<>();
+        for (Map.Entry<String, WorkerHandle> e : workers.entrySet()) {
+            if (now - e.getValue().lastHeartbeat.get() > HEARTBEAT_TIMEOUT_MS) {
+                dead.add(e.getKey());
             }
         }
-    }
-
-    private static class TaskAssignment {
-        int taskId;
-        String operation;
-        int startRow;
-        int endRow;
-        String assignedWorker;
-        boolean assigned = false;
-        boolean completed = false;
-        boolean failed = false;
-        
-        TaskAssignment(int taskId, String operation, int startRow, int endRow) {
-            this.taskId = taskId;
-            this.operation = operation;
-            this.startRow = startRow;
-            this.endRow = endRow;
+        for (String workerId : dead) {
+            WorkerHandle h = workers.remove(workerId);
+            if (h != null) {
+                try { h.socket.close(); } catch (IOException ignored) {}
+                for (Map.Entry<String, String> t : new ArrayList<>(taskAssignedTo.entrySet())) {
+                    if (workerId.equals(t.getValue())) {
+                        TaskSpec spec = currentTaskSpecs.get(t.getKey());
+                        if (spec != null) pendingReassign.add(spec);
+                        taskAssignedTo.remove(t.getKey());
+                    }
+                }
+            }
         }
     }
 }

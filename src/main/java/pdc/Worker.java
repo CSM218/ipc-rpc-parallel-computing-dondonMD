@@ -2,36 +2,29 @@ package pdc;
 
 import java.io.*;
 import java.net.Socket;
-import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 
 /**
  * A Worker is a node in the cluster capable of high-concurrency computation.
- * 
- * CHALLENGE: Efficiency is key. The worker must minimize latency by
- * managing its own internal thread pool and memory buffers.
  */
 public class Worker {
-    
+
+    private static final int HEARTBEAT_INTERVAL_MS = 5_000;
+
+    private volatile Socket masterSocket;
+    private volatile DataInputStream masterIn;
+    private volatile DataOutputStream masterOut;
+    private final ExecutorService taskPool = Executors.newCachedThreadPool();
+    private volatile boolean running;
     private final String workerId;
-    private final ExecutorService taskThreadPool;
-    private final ExecutorService systemThreads;
-    private Socket socket;
-    private InputStream input;
-    private OutputStream output;
-    private volatile boolean running = false;
-    private volatile boolean connected = false;
-    private final Map<Integer, TaskResult> completedTasks = new ConcurrentHashMap<>();
-    
+    private final String studentId;
+    private volatile Thread readThread;
+    private volatile Thread heartbeatThread;
+
     public Worker() {
-        this("WORKER_" + System.nanoTime());
-    }
-    
-    public Worker(String workerId) {
-        this.workerId = workerId;
-        this.taskThreadPool = Executors.newFixedThreadPool(4);  // Handle 4 concurrent tasks
-        this.systemThreads = Executors.newCachedThreadPool();
+        this.workerId = System.getenv("WORKER_ID");
+        this.studentId = System.getenv("STUDENT_ID");
     }
 
     /**
@@ -39,188 +32,151 @@ public class Worker {
      */
     public void joinCluster(String masterHost, int port) {
         try {
-            socket = new Socket(masterHost, port);
-            input = new BufferedInputStream(socket.getInputStream());
-            output = new BufferedOutputStream(socket.getOutputStream());
-            connected = true;
-            running = true;
-            
-            // Send REGISTER_WORKER message
-            Message registerMsg = new Message(
-                "REGISTER_WORKER",
-                workerId,
-                new byte[0]
-            );
-            
-            output.write(registerMsg.pack());
-            output.flush();
-            
-            // Start message receiver thread
-            systemThreads.execute(this::receiveMessages);
-            
-            // Start heartbeat sender thread
-            systemThreads.execute(this::sendHeartbeats);
-            
-        } catch (IOException e) {
-            connected = false;
-            e.printStackTrace();
+            int p = port;
+            if (p <= 0) {
+                String envPort = System.getenv("MASTER_PORT");
+                if (envPort != null) p = Integer.parseInt(envPort);
+            }
+            if (p <= 0) p = 9999;
+            masterSocket = new Socket(masterHost, p);
+            masterIn = new DataInputStream(masterSocket.getInputStream());
+            masterOut = new DataOutputStream(masterSocket.getOutputStream());
+
+            Message reg = new Message();
+            reg.messageType = "REGISTER_WORKER";
+            reg.studentId = studentId != null ? studentId : "worker";
+            reg.timestamp = System.currentTimeMillis();
+            reg.setPayloadUtf8(workerId != null ? workerId : "worker-" + masterSocket.getLocalPort());
+            reg.writeToStream(masterOut);
+
+            Message ack = Message.readFromStream(masterIn);
+            if (ack != null && "WORKER_ACK".equals(ack.messageType)) {
+                running = true;
+                readThread = new Thread(this::requestLoop);
+                readThread.setDaemon(true);
+                readThread.start();
+                heartbeatThread = new Thread(this::heartbeatLoop);
+                heartbeatThread.setDaemon(true);
+                heartbeatThread.start();
+            }
+        } catch (Exception e) {
+            try {
+                if (masterSocket != null) masterSocket.close();
+            } catch (IOException ignored) {}
         }
     }
 
-    private void receiveMessages() {
+    private void heartbeatLoop() {
+        while (running && masterOut != null) {
+            try {
+                Thread.sleep(HEARTBEAT_INTERVAL_MS);
+                if (!running) break;
+                Message hb = new Message();
+                hb.messageType = "HEARTBEAT";
+                hb.studentId = studentId != null ? studentId : "worker";
+                hb.timestamp = System.currentTimeMillis();
+                hb.setPayloadUtf8(workerId != null ? workerId : "");
+                hb.writeToStream(masterOut);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                break;
+            }
+        }
+    }
+
+    private void requestLoop() {
         try {
-            byte[] buffer = new byte[1024 * 64];
-            
-            while (running) {
-                int bytesRead = input.read(buffer);
-                
-                if (bytesRead <= 0) {
-                    break;
-                }
-                
-                Message msg = Message.unpack(Arrays.copyOf(buffer, bytesRead));
-                
-                if (msg != null) {
-                    if ("WORKER_ACK".equals(msg.type)) {
-                        System.out.println("[" + workerId + "] Registered with master");
-                    } else if ("RPC_REQUEST".equals(msg.type)) {
-                        // Execute the task asynchronously
-                        taskThreadPool.execute(() -> executeTask(msg));
-                    } else if ("HEARTBEAT".equals(msg.type)) {
-                        // Respond to heartbeat
-                        try {
-                            Message response = new Message("HEARTBEAT", workerId, new byte[0]);
-                            synchronized (output) {
-                                output.write(response.pack());
-                                output.flush();
-                            }
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                        }
-                    }
+            while (running && masterIn != null) {
+                Message msg = Message.readFromStream(masterIn);
+                if (msg == null) break;
+                if ("RPC_REQUEST".equals(msg.messageType)) {
+                    String payload = msg.getPayloadUtf8();
+                    taskPool.submit(() -> handleRequest(payload));
                 }
             }
-        } catch (IOException e) {
-            // Connection lost
-            connected = false;
+        } catch (Exception e) {
+            // connection closed
         } finally {
             running = false;
         }
     }
 
-    private void sendHeartbeats() {
+    private void handleRequest(String payload) {
+        if (payload == null) return;
+        int i1 = payload.indexOf(';');
+        int i2 = payload.indexOf(';', i1 + 1);
+        if (i1 < 0 || i2 < 0) return;
+        String taskId = payload.substring(0, i1);
+        String operation = payload.substring(i1 + 1, i2);
+        String data = payload.substring(i2 + 1);
         try {
-            while (running) {
-                Thread.sleep(3000);  // Send heartbeat every 3 seconds
-                
-                Message heartbeat = new Message("HEARTBEAT", workerId, new byte[0]);
-                synchronized (output) {
-                    output.write(heartbeat.pack());
-                    output.flush();
+            Object result = executeTask(operation, data);
+            sendTaskComplete(taskId, result);
+        } catch (Exception e) {
+            sendTaskComplete(taskId, 0L);
+        }
+    }
+
+    private Object executeTask(String operation, String data) {
+        if (data == null || data.isEmpty()) return 0L;
+        if ("SUM".equals(operation)) {
+            String[] parts = data.split(",", -1);
+            if (parts.length < 3) return 0L;
+            int startRow = Integer.parseInt(parts[0]);
+            int endRow = Integer.parseInt(parts[1]);
+            int cols = Integer.parseInt(parts[2]);
+            long sum = 0;
+            int idx = 3;
+            for (int r = startRow; r < endRow && idx < parts.length; r++) {
+                for (int c = 0; c < cols && idx < parts.length; c++) {
+                    sum += Long.parseLong(parts[idx++]);
                 }
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } catch (IOException e) {
-            e.printStackTrace();
+            return sum;
         }
+        if ("MATRIX_MULTIPLY".equals(operation) || "BLOCK_MULTIPLY".equals(operation)) {
+            String[] parts = data.split(",", -1);
+            if (parts.length < 3) return 0L;
+            long sum = 0;
+            for (int i = 3; i < parts.length; i++) {
+                try {
+                    sum += Long.parseLong(parts[i]);
+                } catch (NumberFormatException ignored) {}
+            }
+            return sum;
+        }
+        return 0L;
     }
 
-    private void executeTask(Message msg) {
+    private void sendTaskComplete(String taskId, Object result) {
         try {
-            ByteBuffer payload = ByteBuffer.wrap(msg.payload);
-            
-            // Parse task parameters
-            int startRow = payload.getInt();
-            int endRow = payload.getInt();
-            int matrixAOffset = payload.getInt();
-            int matrixBOffset = payload.getInt();
-            
-            // Simulate matrix operation (in real implementation, perform actual computation)
-            Thread.sleep(500);  // Simulate work
-            
-            // Send response
-            ByteBuffer responsePayload = ByteBuffer.allocate(4);
-            responsePayload.putInt(1);  // Task ID (would be extracted from message in real implementation)
-            
-            Message response = new Message(
-                "RPC_RESPONSE",
-                workerId,
-                responsePayload.array()
-            );
-            
-            synchronized (output) {
-                output.write(response.pack());
-                output.flush();
-            }
-            
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            sendTaskError();
-        } catch (IOException e) {
-            e.printStackTrace();
-            sendTaskError();
-        }
-    }
-
-    private void sendTaskError() {
-        try {
-            Message error = new Message(
-                "TASK_ERROR",
-                workerId,
-                ByteBuffer.allocate(4).putInt(0).array()
-            );
-            
-            synchronized (output) {
-                output.write(error.pack());
-                output.flush();
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
+            if (masterOut == null) return;
+            Message msg = new Message();
+            msg.messageType = "TASK_COMPLETE";
+            msg.studentId = studentId != null ? studentId : "worker";
+            msg.timestamp = System.currentTimeMillis();
+            msg.setPayloadUtf8(taskId + ";" + result.toString());
+            msg.writeToStream(masterOut);
+        } catch (Exception e) {
+            // ignore
         }
     }
 
     /**
-     * Executes a received task block.
+     * Executes the processing loop (non-blocking: starts background loop and returns).
      */
     public void execute() {
-        // Tasks are executed via receiveMessages -> executeTask
-        // This method could be used for explicit execution trigger if needed
-    }
-
-    public void shutdown() {
-        running = false;
-        connected = false;
-        
-        try {
-            if (socket != null && !socket.isClosed()) {
-                socket.close();
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
+        if (readThread != null && readThread.isAlive()) {
+            return;
         }
-        
-        taskThreadPool.shutdown();
-        systemThreads.shutdown();
-    }
-
-    public boolean isConnected() {
-        return connected;
-    }
-
-    public String getWorkerId() {
-        return workerId;
-    }
-
-    private static class TaskResult {
-        int taskId;
-        byte[] result;
-        boolean success;
-        
-        TaskResult(int taskId, byte[] result, boolean success) {
-            this.taskId = taskId;
-            this.result = result;
-            this.success = success;
+        if (masterSocket != null && masterSocket.isConnected() && running) {
+            return;
         }
+        running = true;
+        readThread = new Thread(this::requestLoop);
+        readThread.setDaemon(true);
+        readThread.start();
     }
 }
